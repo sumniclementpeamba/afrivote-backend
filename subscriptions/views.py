@@ -40,7 +40,7 @@ class CreatePaymentSessionView(APIView):
         # Pass the requested plan as target_plan
         payment_link = create_payment_link(
             org, amount, target_plan=plan,
-            redirect_url='http://localhost:3000/dashboard/billing'
+            redirect_url='https://afrivote-frontend.vercel.app/dashboard/billing'
         )
         if payment_link:
             return Response({'url': payment_link})
