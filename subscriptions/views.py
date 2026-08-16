@@ -6,7 +6,16 @@ from .models import Subscription, PlanUpgradeRequest
 from .payments import create_payment_link, verify_payment
 from organizations.models import Organization
 from django.utils import timezone
-from datetime import timedelta          # <-- NEW import
+from datetime import timedelta          
+import hashlib
+import hmac
+import json
+from django.conf import settings
+from django.http import HttpResponse
+from django.views.decorators.csrf import csrf_exempt
+from rest_framework.views import APIView
+from rest_framework.response import Response
+from rest_framework.permissions import AllowAny
 
 PLAN_PRICES = {
     'STANDARD': 30,    # GHS 29 per month
@@ -246,3 +255,69 @@ def update_org_limits(organization, plan, subscription_ends_at=None):
     if subscription_ends_at:                      # <-- NEW
         organization.subscription_ends_at = subscription_ends_at
     organization.save()
+
+
+class PaystackWebhookView(APIView):
+    """
+    Handles Paystack webhook events for automatic payment verification.
+    """
+    permission_classes = [AllowAny]
+    authentication_classes = []
+
+    @csrf_exempt
+    def post(self, request):
+        # Verify Paystack signature
+        signature = request.headers.get('x-paystack-signature')
+        if not signature:
+            return Response({"error": "Missing signature"}, status=400)
+
+        payload = request.body.decode('utf-8')
+        secret = settings.PAYSTACK_SECRET_KEY
+        computed_signature = hmac.new(
+            secret.encode('utf-8'),
+            payload.encode('utf-8'),
+            hashlib.sha512
+        ).hexdigest()
+
+        if not hmac.compare_digest(signature, computed_signature):
+            return Response({"error": "Invalid signature"}, status=401)
+
+        # Parse the event
+        event = json.loads(payload)
+        event_type = event.get('event')
+        data = event.get('data', {})
+
+        if event_type == 'charge.success':
+            reference = data.get('reference')
+            metadata = data.get('metadata', {})
+            org_id = metadata.get('organization_id')
+            plan = metadata.get('plan', 'STANDARD')
+
+            if not org_id:
+                return Response({"error": "No organization_id in metadata"}, status=400)
+
+            try:
+                org = Organization.objects.get(id=org_id)
+            except Organization.DoesNotExist:
+                return Response({"error": "Organization not found"}, status=404)
+
+            # Set subscription end date (28 days)
+            new_expiry = timezone.now() + timedelta(days=28)
+
+            # Update org limits and subscription
+            update_org_limits(org, plan, subscription_ends_at=new_expiry)
+
+            Subscription.objects.update_or_create(
+                organization=org,
+                defaults={
+                    'payment_gateway': 'paystack',
+                    'plan': plan,
+                    'status': 'active',
+                    'subscription_ends_at': new_expiry,
+                }
+            )
+
+            return Response({"message": "Webhook processed successfully"})
+
+        # For other event types, just acknowledge
+        return Response({"message": "Event received"})

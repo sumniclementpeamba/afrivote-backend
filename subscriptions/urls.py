@@ -1,6 +1,7 @@
 from django.urls import path
 from .views import (
     CreatePaymentSessionView,
+    PaystackWebhookView,
     VerifyPaymentView,
     RequestUpgradeView,
     ListUpgradeRequestsView,
@@ -15,4 +16,5 @@ urlpatterns = [
     path('upgrade-requests/', ListUpgradeRequestsView.as_view(), name='upgrade-requests'),
     path('upgrade-requests/<uuid:pk>/process/', ProcessUpgradeRequestView.as_view(), name='process-upgrade-request'),
     path('recent-upgrades/', RecentUpgradesView.as_view(), name='recent-upgrades'),   # ← this
+    path('paystack-webhook/', PaystackWebhookView.as_view(), name='paystack-webhook'),
 ]
