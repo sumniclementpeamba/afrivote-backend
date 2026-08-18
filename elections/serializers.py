@@ -44,9 +44,12 @@ class ElectionSerializer(serializers.ModelSerializer):
             'is_anonymous', 'allow_write_ins', 'require_voter_verification',
             'show_results_during_election', 'show_results_after_election',
             'eligible_voter_count', 'total_votes', 'is_active',
+            'is_paid_voting',                # NEW
+            'vote_price',                    # NEW
+            'slug',                          # NEW
             'created_at', 'updated_at',
         ]
-        read_only_fields = ['id', 'organization', 'created_at', 'updated_at', 'is_active']
+        read_only_fields = ['id', 'organization', 'created_at', 'updated_at', 'is_active', 'slug']
 
     def get_organization_name(self, obj):
         return obj.organization.name if obj.organization else None

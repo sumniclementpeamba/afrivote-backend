@@ -11,7 +11,7 @@ BASE_DIR = Path(__file__).resolve().parent.parent
 DATA_UPLOAD_MAX_NUMBER_FIELDS = 10000 
 
 SECRET_KEY = config('SECRET_KEY', default='django-insecure-$m(jmrm!3sc=n1^^90=sd_jt7p7%-67zywy$*y=kf02)$4zafs')
-DEBUG = config('DEBUG', default=False, cast=bool)
+DEBUG = config('DEBUG', default=True, cast=bool)
 
 # Quick-start development settings - unsuitable for production
 # See https://docs.djangoproject.com/en/6.0/howto/deployment/checklist/
@@ -211,4 +211,10 @@ EMAIL_BACKEND = 'django.core.mail.backends.console.EmailBackend'   # prints emai
 # EMAIL_HOST_USER = 'your@email.com'
 # EMAIL_HOST_PASSWORD = 'yourpassword'
 # DEFAULT_FROM_EMAIL = 'AfriVote <noreply@afrivote.com>'
-FRONTEND_URL = 'http://localhost:3000'
+FRONTEND_URL = os.environ.get('FRONTEND_URL', 'http://localhost:3000')
+
+
+SUPER_ADMIN_PAYOUT_MODE = os.environ.get('SUPER_ADMIN_PAYOUT_MODE', 'momo')
+SUPER_ADMIN_PAYOUT_ACCOUNT = os.environ.get('SUPER_ADMIN_PAYOUT_ACCOUNT', '')
+SUPER_ADMIN_PAYOUT_NAME = os.environ.get('SUPER_ADMIN_PAYOUT_NAME', 'AfriVote')
+SUPER_ADMIN_PAYOUT_BANK_CODE = os.environ.get('SUPER_ADMIN_PAYOUT_BANK_CODE', '')  # for momo: MTN/VOD/ATL; for bank: bank code

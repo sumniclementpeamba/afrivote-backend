@@ -1,19 +1,30 @@
 import csv
 from datetime import timedelta
 from collections import defaultdict
+import uuid
+import hashlib
+import hmac
+import json
+from decimal import Decimal
 
-from django.db.migrations import serializer
+from django.db import transaction
+from django.db.models import Count
+from django.shortcuts import get_object_or_404
+from django.utils import timezone
+from django.http import HttpResponse
+from django.core.mail import send_mail
+from django.conf import settings
+
 import requests
+
+from rest_framework.views import APIView
 from rest_framework import viewsets, status, serializers
 from rest_framework.parsers import MultiPartParser, FormParser, JSONParser
 from rest_framework.decorators import action, api_view, permission_classes
 from rest_framework.response import Response
-from rest_framework.permissions import IsAuthenticated
-from django.utils import timezone
-from django.http import HttpResponse
+from rest_framework.permissions import AllowAny, IsAuthenticated
+
 from reportlab.lib.pagesizes import A4
-from django.core.mail import send_mail
-from django.conf import settings
 from reportlab.lib import colors
 from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
 from reportlab.platypus import SimpleDocTemplate, Table, TableStyle, Paragraph, Spacer
@@ -22,7 +33,18 @@ from reportlab.graphics.shapes import Drawing, Rect, String, Line
 
 from organizations.models import Organization
 from organizations.permissions import IsNotVoter, IsOrgAdmin, IsSuperAdmin
-from .models import Election, ElectionShareLink, Position, Candidate, Voter, Vote, VoterRecord
+
+from .models import (
+    Election,
+    ElectionShareLink,
+    Position,
+    Candidate,
+    Voter,
+    Vote,
+    VoterRecord,
+    VoteTransaction,
+    PaidVoteItem,
+)
 from .serializers import (
     ElectionSerializer,
     PositionSerializer,
@@ -58,25 +80,27 @@ def generate_election_results_pdf(election, request=None, disposition='attachmen
     elements.append(Paragraph(f"Status: {election.status}  |  Date: {election.start_date.strftime('%Y-%m-%d %H:%M')}", subtitle_style))
     elements.append(Spacer(1, 12))
 
-    turnout_data = [
-        ['Voter Turnout', ''],
-        ['Eligible Voters', str(eligible_voters)],
-        ['Votes Cast', str(total_votes_cast)],
-        ['Remaining', str(remaining)],
-        ['Turnout', f'{turnout_percent:.1f}%'],
-    ]
-    turnout_table = Table(turnout_data, colWidths=[2.5*inch, 1.5*inch])
-    turnout_table.setStyle(TableStyle([
-        ('BACKGROUND', (0, 0), (-1, 0), colors.HexColor('#e0e7ff')),
-        ('TEXTCOLOR', (0, 0), (-1, 0), colors.HexColor('#1e3a8a')),
-        ('FONTNAME', (0, 0), (-1, 0), 'Helvetica-Bold'),
-        ('FONTSIZE', (0, 0), (-1, -1), 10),
-        ('BOTTOMPADDING', (0, 0), (-1, 0), 8),
-        ('ALIGN', (1, 1), (-1, -1), 'CENTER'),
-        ('GRID', (0, 0), (-1, -1), 0.5, colors.grey),
-    ]))
-    elements.append(turnout_table)
-    elements.append(Spacer(1, 16))
+    # Only include turnout metrics for non-public elections
+    if not election.is_paid_voting:
+        turnout_data = [
+            ['Voter Turnout', ''],
+            ['Eligible Voters', str(eligible_voters)],
+            ['Votes Cast', str(total_votes_cast)],
+            ['Remaining', str(remaining)],
+            ['Turnout', f'{turnout_percent:.1f}%'],
+        ]
+        turnout_table = Table(turnout_data, colWidths=[2.5*inch, 1.5*inch])
+        turnout_table.setStyle(TableStyle([
+            ('BACKGROUND', (0, 0), (-1, 0), colors.HexColor('#e0e7ff')),
+            ('TEXTCOLOR', (0, 0), (-1, 0), colors.HexColor('#1e3a8a')),
+            ('FONTNAME', (0, 0), (-1, 0), 'Helvetica-Bold'),
+            ('FONTSIZE', (0, 0), (-1, -1), 10),
+            ('BOTTOMPADDING', (0, 0), (-1, 0), 8),
+            ('ALIGN', (1, 1), (-1, -1), 'CENTER'),
+            ('GRID', (0, 0), (-1, -1), 0.5, colors.grey),
+        ]))
+        elements.append(turnout_table)
+        elements.append(Spacer(1, 16))
 
     chart_colors = [
         colors.HexColor('#6366f1'), colors.HexColor('#8b5cf6'), colors.HexColor('#d946ef'),
@@ -115,9 +139,10 @@ def generate_election_results_pdf(election, request=None, disposition='attachmen
                     chart_data.append((cand.name, vc, perc))
                 chart_data.sort(key=lambda x: x[1], reverse=True)
 
-                chart_width, chart_height = 450, 220
-                bar_area_bottom, bar_area_top = 40, chart_height - 30
-                bar_area_left, bar_area_right = 50, chart_width - 10
+                # Reduced chart dimensions (450x220 → 400x180)
+                chart_width, chart_height = 400, 180
+                bar_area_bottom, bar_area_top = 30, chart_height - 25
+                bar_area_left, bar_area_right = 40, chart_width - 10
                 bar_area_width = bar_area_right - bar_area_left
                 max_votes = max(v[1] for v in chart_data) if chart_data else 1
 
@@ -128,7 +153,7 @@ def generate_election_results_pdf(election, request=None, disposition='attachmen
                     y = bar_area_bottom + (i * (bar_area_top - bar_area_bottom) / num_ticks)
                     value = int(i * tick_interval)
                     drawing.add(Line(bar_area_left, y, bar_area_right, y, strokeColor=colors.HexColor('#e2e8f0'), strokeWidth=0.5))
-                    drawing.add(String(bar_area_left - 45, y - 5, str(value), fontSize=8, fillColor=colors.gray))
+                    drawing.add(String(bar_area_left - 35, y - 5, str(value), fontSize=7, fillColor=colors.gray))
 
                 num_candidates = len(chart_data)
                 bar_width = bar_area_width / num_candidates * 0.7
@@ -141,9 +166,9 @@ def generate_election_results_pdf(election, request=None, disposition='attachmen
                     color = chart_colors[i % len(chart_colors)]
                     drawing.add(Rect(x, y, bar_width, bar_height, fillColor=color, strokeColor=color))
                     label = f"{votes} ({perc:.1f}%)"
-                    drawing.add(String(x + bar_width/2, y + bar_height + 3, label, fontSize=7, fillColor=colors.HexColor('#334155'), textAnchor='middle'))
-                    short_name = name[:12] + ('...' if len(name) > 12 else '')
-                    drawing.add(String(x + bar_width/2, bar_area_bottom - 12, short_name, fontSize=7, fillColor=colors.HexColor('#475569'), textAnchor='middle'))
+                    drawing.add(String(x + bar_width/2, y + bar_height + 3, label, fontSize=6, fillColor=colors.HexColor('#334155'), textAnchor='middle'))
+                    short_name = name[:10] + ('...' if len(name) > 10 else '')
+                    drawing.add(String(x + bar_width/2, bar_area_bottom - 10, short_name, fontSize=6, fillColor=colors.HexColor('#475569'), textAnchor='middle'))
                 elements.append(drawing)
                 elements.append(Spacer(1, 10))
         else:
@@ -161,14 +186,30 @@ def get_election_results(election, request=None):
         organization=organization, is_active=True, is_verified=True
     ).count()
     total_votes_cast = VoterRecord.objects.filter(election=election).values('voter').distinct().count()
-    results_data = {
-        'election_id': str(election.id),
-        'election_title': election.title,
-        'status': election.status,
-        'eligible_voters': eligible_voters,
-        'total_votes_cast': total_votes_cast,
-        'positions': []
-    }
+
+    if election.is_paid_voting:
+        results_data = {
+            'election_id': str(election.id),
+            'election_title': election.title,
+            'status': election.status,
+            'is_paid_voting': True,
+            'eligible_voters': None,
+            'total_votes_cast': None,
+            'positions': []
+        }
+    else:
+        remaining = eligible_voters - total_votes_cast
+        turnout_percent = (total_votes_cast / eligible_voters * 100) if eligible_voters > 0 else 0
+        results_data = {
+            'election_id': str(election.id),
+            'election_title': election.title,
+            'status': election.status,
+            'is_paid_voting': False,
+            'eligible_voters': eligible_voters,
+            'total_votes_cast': total_votes_cast,
+            'positions': []
+        }
+
     positions = election.positions.all()
     for position in positions:
         total_votes_for_position = Vote.objects.filter(election=election, position=position).count()
@@ -377,7 +418,6 @@ class ElectionViewSet(BaseOrganizationViewSet):
         if VoterRecord.objects.filter(voter=voter, election=election, position=position).exists():
             return Response({"error": "You have already voted for this position."}, status=403)
 
-        import hashlib, uuid
         vote_hash = hashlib.sha256(f"{voter.id}{election.id}{uuid.uuid4()}".encode()).hexdigest()
 
         vote = serializer.save(
@@ -452,7 +492,6 @@ class ElectionViewSet(BaseOrganizationViewSet):
         election = self.get_object()
         org = election.organization
 
-        # Free plan: allow only once
         if org.plan == 'FREE':
             if org.free_results_downloads_used >= 1:
                 return Response({"error": "You've used your free share. Upgrade to continue."}, status=403)
@@ -464,7 +503,6 @@ class ElectionViewSet(BaseOrganizationViewSet):
         frontend_base = getattr(settings, 'FRONTEND_URL', 'http://localhost:3000')
         share_url = f'{frontend_base}/share/{link.token}/'
 
-        # Increment free usage counter
         if org.plan == 'FREE':
             org.free_results_downloads_used += 1
             org.save()
@@ -487,14 +525,12 @@ class ElectionViewSet(BaseOrganizationViewSet):
         election = self.get_object()
         org = election.organization
 
-        # Free plan: allow only one PDF download
         if org.plan == 'FREE':
             if org.free_results_downloads_used >= 1:
                 return Response({"error": "You've used your free PDF download. Upgrade to continue."}, status=403)
 
         response = generate_election_results_pdf(election, request)
 
-        # Increment free usage counter
         if org.plan == 'FREE':
             org.free_results_downloads_used += 1
             org.save()
@@ -521,10 +557,14 @@ class ElectionViewSet(BaseOrganizationViewSet):
         writer = csv.writer(response)
         writer.writerow(['Election Title', election.title])
         writer.writerow(['Status', election.status])
-        writer.writerow(['Eligible Voters', eligible_voters])
-        writer.writerow(['Votes Cast', total_votes_cast])
-        writer.writerow(['Remaining', remaining])
-        writer.writerow(['Turnout %', f'{turnout_percent:.1f}%'])
+
+        # Only include turnout rows for non-paid elections
+        if not election.is_paid_voting:
+            writer.writerow(['Eligible Voters', eligible_voters])
+            writer.writerow(['Votes Cast', total_votes_cast])
+            writer.writerow(['Remaining', remaining])
+            writer.writerow(['Turnout %', f'{turnout_percent:.1f}%'])
+
         writer.writerow([])
 
         positions = election.positions.all()
@@ -603,10 +643,8 @@ class CandidateViewSet(BaseOrganizationViewSet):
         if election.status not in ['DRAFT', 'SCHEDULED']:
             raise serializers.ValidationError({'election': 'Candidates can only be added to draft or scheduled elections.'})
 
-        # Get organisation from the election
         org = election.organization
 
-        # Save with organisation, active and approved flags
         serializer.save(
             organization=org,
             is_active=True,
@@ -739,6 +777,271 @@ class VoterViewSet(BaseOrganizationViewSet):
                 pass
 
         return Response({"message": f"SMS invitations sent to {sent_count} voter(s)."})
+
+
+# ─── Paid Voting Endpoints ────────────────────────────────────────────────────
+class InitiatePaidVoteView(APIView):
+    permission_classes = [AllowAny]
+
+    def post(self, request, election_id):
+        election = get_object_or_404(Election, id=election_id)
+        if not election.is_paid_voting:
+            return Response({"error": "This election is not paid voting."}, status=400)
+
+        items = request.data.get('items')
+        if not items or not isinstance(items, list) or len(items) == 0:
+            return Response({"error": "items list is required."}, status=400)
+
+        validated_items = []
+        total_votes = 0
+        for item in items:
+            candidate_id = item.get('candidate_id')
+            votes = int(item.get('votes', 1))
+            if votes < 1:
+                return Response({"error": "Votes must be at least 1."}, status=400)
+
+            candidate = get_object_or_404(Candidate, id=candidate_id, position__election=election)
+            validated_items.append({'candidate': candidate, 'votes': votes})
+            total_votes += votes
+
+        amount = election.vote_price * total_votes
+        paystack_secret = settings.PAYSTACK_SECRET_KEY
+        reference = str(uuid.uuid4())
+
+        transaction_obj = VoteTransaction.objects.create(
+            election=election,
+            candidate=validated_items[0]['candidate'],  # temporary candidate; items store actual
+            voter=request.user if request.user.is_authenticated else None,
+            votes=total_votes,
+            amount_paid=amount,
+            paystack_reference=reference,
+            status='pending'
+        )
+
+        for item in validated_items:
+            PaidVoteItem.objects.create(
+                transaction=transaction_obj,
+                candidate=item['candidate'],
+                votes=item['votes']
+            )
+
+        email = None
+        if request.user.is_authenticated:
+            email = request.user.email
+        if not email:
+            email = request.data.get('email')
+        if not email:
+            email = 'voter@afrivote.com'
+
+        headers = {
+            "Authorization": f"Bearer {paystack_secret}",
+            "Content-Type": "application/json",
+        }
+        data = {
+            "email": email,
+            "amount": int(amount * 100),
+            "reference": reference,
+            "metadata": {
+                "transaction_id": str(transaction_obj.id),
+                "election_id": str(election.id),
+            },
+            "callback_url": f"{settings.FRONTEND_URL}/public/election/{election.slug}?reference={reference}",
+        }
+
+        response = requests.post("https://api.paystack.co/transaction/initialize", json=data, headers=headers)
+        if response.status_code == 200:
+            payment_data = response.json().get('data', {})
+            authorization_url = payment_data.get('authorization_url')
+            if authorization_url:
+                return Response({"url": authorization_url, "reference": reference})
+        return Response({"error": "Failed to initialize payment"}, status=500)
+
+
+class VerifyPaidVoteView(APIView):
+    permission_classes = [AllowAny]
+
+    def post(self, request, election_id):
+        reference = request.data.get('reference')
+        if not reference:
+            return Response({"error": "Reference required"}, status=400)
+
+        with transaction.atomic():
+            vote_transaction = get_object_or_404(
+                VoteTransaction.objects.select_for_update(),
+                paystack_reference=reference
+            )
+
+            if vote_transaction.status == 'success':
+                return Response({"message": "Already verified", "status": "success"})
+
+            paystack_secret = settings.PAYSTACK_SECRET_KEY
+            headers = {"Authorization": f"Bearer {paystack_secret}"}
+            verify_response = requests.get(
+                f"https://api.paystack.co/transaction/verify/{reference}",
+                headers=headers
+            )
+            if verify_response.status_code != 200:
+                return Response({"error": "Verification failed"}, status=400)
+
+            data = verify_response.json().get('data', {})
+            if data.get('status') != 'success':
+                return Response({"error": "Payment not successful"}, status=400)
+
+            amount_paid = Decimal(str(data.get('amount', 0))) / 100
+            commission = amount_paid * Decimal('0.20')
+            organizer_earned = amount_paid - commission
+
+            vote_transaction.status = 'success'
+            vote_transaction.commission_amount = commission
+            vote_transaction.organizer_earned = organizer_earned
+            vote_transaction.save()
+
+            election = vote_transaction.election
+            org = election.organization
+
+            for item in vote_transaction.items.all():
+                candidate = item.candidate
+                for _ in range(item.votes):
+                    vote_hash = hashlib.sha256(
+                        f"{reference}-{uuid.uuid4()}".encode()
+                    ).hexdigest()
+                    position = candidate.position
+                    Vote.objects.create(
+                        organization=org,
+                        election=election,
+                        position=position,
+                        candidate=candidate,
+                        vote_hash=vote_hash,
+                        ip_address=request.META.get('REMOTE_ADDR'),
+                        user_agent=request.META.get('HTTP_USER_AGENT', '')
+                    )
+
+            org.wallet_balance += organizer_earned
+            org.total_earned += organizer_earned
+            org.save()
+
+            return Response({"message": "Votes credited successfully", "status": "success"})
+
+
+class PublicElectionResultsView(APIView):
+    permission_classes = [AllowAny]
+
+    def get(self, request, election_id):
+        election = get_object_or_404(Election, id=election_id)
+        if not election.show_results_during_election and not election.show_results_after_election:
+            return Response({"error": "Results not available"}, status=403)
+
+        candidates = Candidate.objects.filter(position__election=election).annotate(
+            vote_count=Count('votes', distinct=True)
+        ).order_by('-vote_count')
+
+        data = []
+        for c in candidates:
+            data.append({
+                'id': str(c.id),
+                'name': c.name,
+                'position': c.position.title,
+                'vote_count': c.vote_count,
+                'photo': request.build_absolute_uri(c.photo.url) if c.photo else None,  # absolute URL
+            })
+        return Response(data)
+
+
+class PublicElectionDetailView(APIView):
+    permission_classes = [AllowAny]
+
+    def get(self, request, election_id):
+        election = get_object_or_404(Election, id=election_id, is_paid_voting=True)
+        positions_data = []
+        for position in election.positions.all():
+            candidates = []
+            for candidate in position.candidates.filter(is_active=True):
+                candidates.append({
+                    'id': str(candidate.id),
+                    'name': candidate.name,
+                    'vote_count': candidate.vote_count,
+                    'photo': request.build_absolute_uri(candidate.photo.url) if candidate.photo else None,
+                })
+            positions_data.append({
+                'id': str(position.id),
+                'title': position.title,
+                'candidates': candidates,
+            })
+
+        data = {
+            'id': str(election.id),
+            'title': election.title,
+            'description': election.description,
+            'is_paid_voting': election.is_paid_voting,
+            'vote_price': str(election.vote_price),
+            'start_date': election.start_date,
+            'end_date': election.end_date,
+            'status': election.status,
+            'positions': positions_data,
+        }
+        return Response(data)
+
+
+class PublicElectionDetailBySlugView(APIView):
+    permission_classes = [AllowAny]
+
+    def get(self, request, slug):
+        election = get_object_or_404(Election, slug=slug, is_paid_voting=True)
+        positions_data = []
+        for position in election.positions.all():
+            candidates = []
+            for candidate in position.candidates.filter(is_active=True):
+                candidates.append({
+                    'id': str(candidate.id),
+                    'name': candidate.name,
+                    'vote_count': candidate.vote_count,
+                    'photo': request.build_absolute_uri(candidate.photo.url) if candidate.photo else None,
+                })
+            positions_data.append({
+                'id': str(position.id),
+                'title': position.title,
+                'candidates': candidates,
+            })
+
+        data = {
+            'id': str(election.id),
+            'title': election.title,
+            'description': election.description,
+            'is_paid_voting': election.is_paid_voting,
+            'vote_price': str(election.vote_price),
+            'start_date': election.start_date,
+            'end_date': election.end_date,
+            'status': election.status,
+            'positions': positions_data,
+            'slug': election.slug,
+        }
+        return Response(data)
+
+
+class PublicPaidElectionsListView(APIView):
+    permission_classes = [AllowAny]
+
+    def get(self, request):
+        elections = Election.objects.filter(
+            is_deleted=False,
+            is_paid_voting=True,
+            status='ACTIVE'  # only currently active elections
+        ).order_by('-start_date')
+
+        data = []
+        for election in elections:
+            data.append({
+                'id': str(election.id),
+                'title': election.title,
+                'description': election.description,
+                'vote_price': str(election.vote_price),
+                'status': election.status,
+                'start_date': election.start_date,
+                'end_date': election.end_date,
+                'slug': election.slug,
+                'organization_name': election.organization.name,
+            })
+        return Response(data)
 
 
 @api_view(['GET'])

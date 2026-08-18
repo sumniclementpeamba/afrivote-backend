@@ -3,6 +3,7 @@ from django.db.models.signals import pre_delete
 from django.dispatch import receiver
 from django.utils import timezone
 import uuid
+from django.utils.text import slugify
 
 
 class Election(models.Model):
@@ -48,6 +49,7 @@ class Election(models.Model):
     eligible_voter_count = models.IntegerField(default=0)
     minimum_voter_age = models.IntegerField(default=0)
     allowed_domains = models.TextField(blank=True)
+    slug = models.SlugField(max_length=255, unique=True, blank=True, null=True)
 
     created_by = models.ForeignKey(
         'accounts.User',
@@ -56,6 +58,10 @@ class Election(models.Model):
         related_name='created_elections'
     )
     is_deleted = models.BooleanField(default=False)
+    # ─── NEW: Paid voting fields ─────────────────────────────────────
+    is_paid_voting = models.BooleanField(default=False)
+    vote_price = models.DecimalField(max_digits=10, decimal_places=2, default=1.00)  # GH₵ 1 per vote
+    # ─────────────────────────────────────────────────────────────────
 
     class Meta:
         db_table = 'elections'
@@ -80,6 +86,16 @@ class Election(models.Model):
                 # Auto-fix: set end_date to start_date + 1 hour (or 1 day)
                 from datetime import timedelta
                 self.end_date = self.start_date + timedelta(days=1)
+        super().save(*args, **kwargs)
+
+
+    def save(self, *args, **kwargs):
+        if not self.slug:
+            base_slug = slugify(self.title) if self.title else 'election'
+            unique_slug = base_slug
+            while Election.objects.filter(slug=unique_slug).exists():
+                unique_slug = f"{base_slug}-{uuid.uuid4().hex[:6]}"
+            self.slug = unique_slug
         super().save(*args, **kwargs)
 
     @property
@@ -325,3 +341,59 @@ class ElectionShareLink(models.Model):
         if self.expires_at and timezone.now() > self.expires_at:
             return False
         return True
+
+
+# ─── NEW: Paid Voting Transaction ─────────────────────────────────────────────
+class VoteTransaction(models.Model):
+    election = models.ForeignKey(
+        Election,
+        on_delete=models.CASCADE,
+        related_name='vote_transactions'
+    )
+    candidate = models.ForeignKey(
+        Candidate,
+        on_delete=models.CASCADE,
+        related_name='vote_transactions'
+    )
+    voter = models.ForeignKey(
+        'accounts.User',
+        null=True,
+        blank=True,
+        on_delete=models.SET_NULL,
+        related_name='paid_votes'
+    )
+    votes = models.PositiveIntegerField(default=1)
+    amount_paid = models.DecimalField(max_digits=10, decimal_places=2)
+    paystack_reference = models.CharField(max_length=100, unique=True)
+    status = models.CharField(max_length=20, default='pending')  # pending, success, failed
+    commission_amount = models.DecimalField(max_digits=10, decimal_places=2, default=0.00)
+    organizer_earned = models.DecimalField(max_digits=10, decimal_places=2, default=0.00)
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        db_table = 'vote_transactions'
+        ordering = ['-created_at']
+        indexes = [
+            models.Index(fields=['election', 'status']),
+            models.Index(fields=['paystack_reference']),
+        ]
+
+    def __str__(self):
+        return f"{self.election.title} - {self.candidate.name} - {self.votes} votes"
+
+
+class PaidVoteItem(models.Model):
+    transaction = models.ForeignKey(
+        VoteTransaction,
+        on_delete=models.CASCADE,
+        related_name='items'
+    )
+    candidate = models.ForeignKey(
+        Candidate,
+        on_delete=models.CASCADE
+    )
+    votes = models.PositiveIntegerField(default=1)
+
+    class Meta:
+        db_table = 'paid_vote_items'
+        ordering = ['id']
