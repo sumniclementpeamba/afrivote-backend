@@ -50,6 +50,7 @@ class Election(models.Model):
     minimum_voter_age = models.IntegerField(default=0)
     allowed_domains = models.TextField(blank=True)
     slug = models.SlugField(max_length=255, unique=True, blank=True, null=True)
+    event_image = models.ImageField(upload_to='election_events/', null=True, blank=True)
 
     created_by = models.ForeignKey(
         'accounts.User',

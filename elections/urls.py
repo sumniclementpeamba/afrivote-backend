@@ -17,6 +17,7 @@ from .views import (
     PublicElectionDetailView,
     PublicElectionDetailBySlugView,
     PublicPaidElectionsListView,
+    PublicCandidateDetailView,
 )
 
 router = DefaultRouter()
@@ -34,6 +35,7 @@ urlpatterns = [
     path('public/elections/<uuid:election_id>/', PublicElectionDetailView.as_view(), name='public-election-detail'),
     path('public/elections/slug/<slug:slug>/', PublicElectionDetailBySlugView.as_view(), name='public-election-detail-by-slug'),
     path('public/elections/', PublicPaidElectionsListView.as_view(), name='public-elections-list'),
+    path('public/candidates/<uuid:candidate_id>/', PublicCandidateDetailView.as_view(), name='public-candidate-detail'),
 
     # Paid voting endpoints – full path: /api/<election_id>/initiate-paid-vote/ etc.
     path('<uuid:election_id>/initiate-paid-vote/', InitiatePaidVoteView.as_view(), name='initiate-paid-vote'),

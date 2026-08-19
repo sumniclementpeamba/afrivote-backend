@@ -1014,6 +1014,7 @@ class PublicElectionDetailBySlugView(APIView):
             'status': election.status,
             'positions': positions_data,
             'slug': election.slug,
+            'event_image': request.build_absolute_uri(election.event_image.url) if election.event_image else None,
         }
         return Response(data)
 
@@ -1040,7 +1041,31 @@ class PublicPaidElectionsListView(APIView):
                 'end_date': election.end_date,
                 'slug': election.slug,
                 'organization_name': election.organization.name,
+                'event_image': request.build_absolute_uri(election.event_image.url) if election.event_image else None,
             })
+        return Response(data)
+
+
+class PublicCandidateDetailView(APIView):
+    permission_classes = [AllowAny]
+
+    def get(self, request, candidate_id):
+        candidate = get_object_or_404(Candidate, id=candidate_id, is_active=True)
+        election = candidate.position.election if candidate.position else None
+
+        data = {
+            'id': str(candidate.id),
+            'name': candidate.name,
+            'photo': request.build_absolute_uri(candidate.photo.url) if candidate.photo else None,
+            'biography': candidate.biography,
+            'biography_file': request.build_absolute_uri(candidate.biography_file.url) if candidate.biography_file else None,
+            'manifesto': candidate.manifesto,
+            'manifesto_file': request.build_absolute_uri(candidate.manifesto_file.url) if candidate.manifesto_file else None,
+            'position': candidate.position.title if candidate.position else '',
+            'election_title': election.title if election else '',
+            'election_slug': election.slug if election else '',
+            'vote_count': candidate.vote_count,
+        }
         return Response(data)
 
 

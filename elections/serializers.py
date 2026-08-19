@@ -47,7 +47,7 @@ class ElectionSerializer(serializers.ModelSerializer):
             'is_paid_voting',                # NEW
             'vote_price',                    # NEW
             'slug',                          # NEW
-            'created_at', 'updated_at',
+            'created_at', 'updated_at', 'event_image',
         ]
         read_only_fields = ['id', 'organization', 'created_at', 'updated_at', 'is_active', 'slug']
 
